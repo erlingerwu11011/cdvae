@@ -1,0 +1,45 @@
+# @package _global_
+
+# specify here default configuration
+# order of defaults determines the order in which configs override each other
+defaults:
+  - _self_
+  - model: cdvae
+  - dataset: ar_sim
+  - callbacks: default
+  - logger: tensorboard # set logger here or use command line (e.g. `python train.py logger=tensorboard`)
+  - trainer: gpu
+  - paths: default
+  - extras: default
+  - hydra: default
+
+  - experiment: null
+
+  - optional local: default
+
+  # debugging config (enable through command line, e.g. `python train.py debug=default)
+  - debug: null
+
+
+# Experiment specific parameters
+exp:
+  seed: [11]                         # Random seed for all the initialisations, dataset generation etc.
+  unscale_rmse: ???                 # RMSE with unnormalised targets; Will be defined with +dataset=...
+  percentage_rmse: ???              # RMSE as percentage wrt norm_const; Will be defined with +dataset=...
+
+  alpha: 1.0                        # Has no full effect, if update_alpha is Trued
+  update_alpha: True                # Exponential growth of alpha from 0.0 to 1.0
+  alpha_rate: exp                   # exp / lin
+  balancing:                        # grad_reverse / domain_confusion
+
+  test_robustness: False
+
+  bce_weight: False                 # Weight in BCE loss, proportional to treatment frequency
+  label_smoothing: 0
+  weights_ema:                      # Exponential moving average of weights
+  beta: 0.99                        # EMA beta
+
+
+# task name, determines output directory path
+task_name: "train"
+tags: ["dev"]

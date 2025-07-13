@@ -1,0 +1,39 @@
+# @package _global_
+dataset:
+  _target_: src.data.ar_sim.dataset.ARSimulationDatasetCollection
+  name: ar_sim_generator
+  d_vitals: 100
+  d_random_effects: 100
+  treat_imb: 1
+  p: 10
+  cov_rho: 0.5
+  cov_var: 0.3
+  re_centers: 8
+  re_cluster_std: 0.2
+  coeff: 0.7
+  num_patients:
+    train: 1000
+    val: 500
+    test: 14
+  window_size: 15
+  seq_length: 75
+  max_seq_length: 75
+  subset_name: train # ?
+  projection_horizon: 1
+  seed: ${exp.seed}
+  lag: 1
+  val_batch_size: 256
+  cf_seq_mode: sliding_treatment
+  treatment_mode: multilabel
+  num_treatments: 1
+  type_static_feat: null # 'true' # 'true', 'rep' or null
+
+model:
+  dim_treatments: ${dataset.num_treatments}
+  dim_vitals: ${dataset.d_vitals}
+  dim_static_features: 0
+  dim_outcomes: 1
+
+exp:
+  unscale_rmse: True
+  percentage_rmse: False
