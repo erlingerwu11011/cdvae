@@ -433,6 +433,25 @@ class CDVAE(BRCausalModel):
             device=self.device,
         )
 
+        # Step-3 generative path: explicit b/h0/s routing
+        fused_dim = self.br_size + 3 * self.z_latent_dim
+        self.health_adapter = nn.Sequential(
+            nn.Linear(fused_dim, self.fc_hidden_units),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(self.fc_hidden_units, self.z_latent_dim),
+        )
+        self.fault_adapter = nn.Sequential(
+            nn.Linear(fused_dim, self.fc_hidden_units),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(self.fc_hidden_units, self.z_latent_dim),
+        )
+
+        # Lightweight split priors (b, h0, s|regime) for anti-collapse scaffolding
+        self.no_fault_regime_id = 0
+        self.num_regimes = max(int(getattr(self.hparams.dataset, "num_treatments", 1)), 1)
+        self.s_prior_mu_embedding = nn.Embedding(self.num_regimes, self.z_latent_dim)
+        nn.init.zeros_(self.s_prior_mu_embedding.weight)
+
     def _init_specific(self, sub_args: DictConfig):
         """
         Initializes model-specific parameters.
@@ -447,6 +466,7 @@ class CDVAE(BRCausalModel):
                 "re",
                 "q_re_given_yxw",
                 "RE_hidden_states",
+                "inference_outputs",
             ],
         )
         try:
@@ -584,13 +604,32 @@ class CDVAE(BRCausalModel):
         br = self.br_treatment_outcome_head.build_br(c)
         return br
 
+    @staticmethod
+    def _expand_episode_latent_cdvae(z: torch.Tensor, seq_len: int) -> torch.Tensor:
+        return z.unsqueeze(1).expand(-1, seq_len, -1)
+
+    def _compose_re_latent(self, br: torch.Tensor, b: torch.Tensor, h0: torch.Tensor, s: torch.Tensor):
+        seq_len = br.shape[1]
+        b_seq = self._expand_episode_latent_cdvae(b, seq_len)
+        h0_seq = self._expand_episode_latent_cdvae(h0, seq_len)
+        fused = torch.cat([br, b_seq, h0_seq, s], dim=-1)
+        z_health = self.health_adapter(fused)
+        z_fault = self.fault_adapter(fused)
+        return z_health + z_fault
+
     def forward(self, batch: dict, detach_treatment: bool = False):
         """
         Forward pass through the model.
         """
         x, x_posterior = self.build_input(batch)
 
-        mu_RE, log_var_RE, RE_hidden_states = self.inference_re_given_yxw(x_posterior)
+        inference_outputs = self.inference_re_given_yxw(
+            x_posterior, regime_id=batch.get("regime_id")
+        )
+
+        mu_RE = inference_outputs["q_b"]["loc"]
+        log_var_RE = inference_outputs["q_b"]["logvar"]
+        RE_hidden_states = inference_outputs["enc_feat"]
         if torch.isnan(mu_RE).any():
             print("The mu_RE contains NaN values.")
 
@@ -605,20 +644,31 @@ class CDVAE(BRCausalModel):
             reinterpreted_batch_ndims=1,  # interpret dim 1 (d_re diemion as a single event)
         )  # ? Do we need a permutation ?
         re = q_re_given_yxw.rsample()
-        re_extended = re.unsqueeze(1).repeat(1, x.shape[1], 1)
 
         br = self.build_br(x)
         treatment_pred = self.br_treatment_outcome_head.build_treatment(
             br, detached=detach_treatment
         )
 
+        b = inference_outputs["b"]
+        h0 = inference_outputs["h0"]
+        s = inference_outputs["s"]
+        re_struct = self._compose_re_latent(br, b, h0, s)
+
         curr_treatments = batch["current_treatments"]
         outcome_pred = self.br_treatment_outcome_head.build_outcome(
-            br, re_extended, curr_treatments, y_dist_type=self.y_dist_type
+            br, re_struct, curr_treatments, y_dist_type=self.y_dist_type
         )
 
         return self.ForwardOutputs(
-            treatment_pred, outcome_pred, br, mu_RE, re, q_re_given_yxw, RE_hidden_states
+            treatment_pred,
+            outcome_pred,
+            br,
+            mu_RE,
+            re,
+            q_re_given_yxw,
+            RE_hidden_states,
+            inference_outputs,
         )
 
     def _get_y_dist(self, outcome_pred: torch.Tensor):
@@ -644,7 +694,16 @@ class CDVAE(BRCausalModel):
         Returns:
             torch.Tensor: The total loss for the given stage.
         """
-        treatment_pred, outcome_pred, br, _, re, q_re_given_yxw, RE_hidden_states = self(batch)
+        (
+            treatment_pred,
+            outcome_pred,
+            br,
+            _,
+            re,
+            q_re_given_yxw,
+            RE_hidden_states,
+            inference_outputs,
+        ) = self(batch)
         curr_treatments = batch["current_treatments"]
 
         p_w_x = self.treat_normalizer(treatment_pred)
@@ -657,7 +716,7 @@ class CDVAE(BRCausalModel):
 
         loss_1mm = self.reg_matching(RE_hidden_states)
 
-        kld_z, kld_c = self.kld_loss(q_re_given_yxw)
+        kld_z, kld_c = self.kld_loss(q_re_given_yxw, inference_outputs, batch.get("regime_id"))
         if torch.isnan(kld_z).any():
             print("The kld_z contains NaN values.")
 
@@ -787,10 +846,44 @@ class CDVAE(BRCausalModel):
             mu_RE = ForwardOutputs.mu_RE
             return outcome_pred.cpu(), br.cpu(), mu_RE.cpu()
 
-    def kld_loss(self, q_re_given_yxw: torch.distributions.Normal) -> torch.Tensor:
+    def _gaussian_kl(self, loc_q: torch.Tensor, logvar_q: torch.Tensor, loc_p: torch.Tensor):
+        var_q = torch.exp(logvar_q)
+        return 0.5 * (var_q + (loc_q - loc_p) ** 2 - 1.0 - logvar_q).sum(dim=-1)
+
+    def kld_loss(
+        self,
+        q_re_given_yxw: torch.distributions.Normal,
+        inference_outputs: dict = None,
+        regime_id: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
-        Computes the Kullback-Leibler Divergence losses.
+        Computes KL losses.
+
+        Main path (step-3): split priors for b / h0 / s.
+        Fallback path: legacy RE-vs-GMM KL.
         """
+        if inference_outputs is not None:
+            q_b = inference_outputs["q_b"]
+            q_h0 = inference_outputs["q_h0"]
+            q_s = inference_outputs["q_s"]
+
+            kld_b = self._gaussian_kl(q_b["loc"], q_b["logvar"], torch.zeros_like(q_b["loc"]))
+            kld_h0 = self._gaussian_kl(
+                q_h0["loc"], q_h0["logvar"], torch.zeros_like(q_h0["loc"])
+            )
+
+            if regime_id is None:
+                regime_id = torch.zeros(q_s["loc"].shape[0], device=q_s["loc"].device).long()
+            if regime_id.ndim > 1:
+                regime_id = regime_id.squeeze(-1)
+            regime_id = regime_id.clamp(min=0, max=self.num_regimes - 1)
+            s_loc_prior = self.s_prior_mu_embedding(regime_id).unsqueeze(1).expand_as(q_s["loc"])
+            kld_s = self._gaussian_kl(q_s["loc"], q_s["logvar"], s_loc_prior)
+
+            # Keep the historical two-term interface: z-term + c-term
+            kld_z = kld_b + kld_h0
+            kld_c = kld_s
+            return kld_z, kld_c
 
         if self.cov_type_p_z_given_c == "diag":
             sigma_square_p_z_given_c = self.gmm_prior.sigma_square_p_z_given_c
@@ -804,52 +897,27 @@ class CDVAE(BRCausalModel):
         elif self.cov_type_p_z_given_c == "full":
             l_mat_p_z_given_c = self.gmm_prior.l_mat_p_z_given_c
             p_z_given_c = D.MultivariateNormal(
-                loc=self.gmm_prior.mu_p_z_given_c.permute(
-                    1, 0
-                ),  # ! permutation gives (n_clusters, z_latent_dim)
-                scale_tril=l_mat_p_z_given_c.permute(
-                    2, 0, 1
-                ),  # !  (z_latent_dim, z_latent_dim, n_clusters) - >   permutation gives (n_clusters, z_latent_dim, z_latent_dim)
+                loc=self.gmm_prior.mu_p_z_given_c.permute(1, 0),
+                scale_tril=l_mat_p_z_given_c.permute(2, 0, 1),
             )
 
         re = q_re_given_yxw.rsample((self.mc_sample_size,))
-
         re_pad = torch.unsqueeze(re, -2)
-        log_prob_p_z_given_c = p_z_given_c.log_prob(
-            re_pad
-        )  #! shape [mc_sample, batch_size, n_clsuters]
-        log_prob_p_c = torch.log(self.gmm_prior.pi_p_c)  #! shape (n_clsuters)
+        log_prob_p_z_given_c = p_z_given_c.log_prob(re_pad)
+        log_prob_p_c = torch.log(self.gmm_prior.pi_p_c)
         prob_p_z = torch.exp(log_prob_p_z_given_c + log_prob_p_c.unsqueeze(0).unsqueeze(0)).sum(
             dim=2
-        )  # sum over clsuter dim -> [mc_samples, batch_size]
+        )
         log_prob_p_z = torch.log(prob_p_z.clamp(min=1e-8))
-        log_prob_q_re_given_yxw = q_re_given_yxw.log_prob(re)  # [mc_samples, batch_size]
-        kld_z = torch.mean(
-            log_prob_q_re_given_yxw - log_prob_p_z, dim=0
-        )  # mean over mc sample -> (batch_size)
-
+        log_prob_q_re_given_yxw = q_re_given_yxw.log_prob(re)
+        kld_z = torch.mean(log_prob_q_re_given_yxw - log_prob_p_z, dim=0)
         kld_q_re_given_yxw_vs_p_z_given_c = torch.mean(
             log_prob_q_re_given_yxw.unsqueeze(-1) - log_prob_p_z_given_c, dim=0
-        )  # mean over mc sample -> (batch_size, n_clusters)
-
-        if torch.isnan(kld_q_re_given_yxw_vs_p_z_given_c).any():
-            print("The kld_q_re_given_yxw_vs_p_z_given_c contains NaN values.")
-
-        if torch.isnan(log_prob_p_c).any():
-            print("The log_prob_p_c contains NaN values.")
-
-        if torch.isnan(torch.exp(kld_z)).any():
-            print("The torch.exp(kld_z) contains NaN values.")
-
+        )
         logsum = torch.logsumexp(
             -kld_q_re_given_yxw_vs_p_z_given_c + log_prob_p_c.unsqueeze(0), dim=1
         )
-
-        if torch.isnan(logsum).any():
-            print("The logsum contains NaN values.")
-
-        kld_c = -kld_z - logsum  # -torch.log(Z_q_re_given_yxw)
-
+        kld_c = -kld_z - logsum
         return kld_z, kld_c
 
     def y_loss(
@@ -1119,6 +1187,54 @@ class CDVAE(BRCausalModel):
         self.with_mu_RE = False
         return mu_RE.numpy()
 
+    def counterfactual_query(self, batch: dict, target_regime: int = 0):
+        """
+        Abduction-Action-Prediction counterfactual query:
+          1) infer b, h0, s from factual inputs
+          2) keep b and h0 fixed
+          3) intervene on s (default: do(s=0) for no-fault regime)
+          4) decode factual and counterfactual outcomes
+        """
+        x, x_posterior = self.build_input(batch)
+        br = self.build_br(x)
+        curr_treatments = batch["current_treatments"]
+
+        inference_outputs = self.inference_re_given_yxw(
+            x_posterior, regime_id=batch.get("regime_id")
+        )
+        b = inference_outputs["b"]
+        h0 = inference_outputs["h0"]
+        s = inference_outputs["s"]
+
+        re_fact = self._compose_re_latent(br, b, h0, s)
+        y_factual = self.br_treatment_outcome_head.build_outcome(
+            br, re_fact, curr_treatments, y_dist_type=self.y_dist_type
+        )
+
+        if target_regime == self.no_fault_regime_id:
+            s_cf = torch.zeros_like(s)
+        else:
+            regime = torch.full(
+                (s.shape[0],), int(target_regime), dtype=torch.long, device=s.device
+            )
+            s_cf_center = self.s_prior_mu_embedding(regime).unsqueeze(1).expand_as(s)
+            s_cf = s_cf_center
+
+        re_cf = self._compose_re_latent(br, b, h0, s_cf)
+        y_counterfactual = self.br_treatment_outcome_head.build_outcome(
+            br, re_cf, curr_treatments, y_dist_type=self.y_dist_type
+        )
+
+        return {
+            "y_factual": y_factual,
+            "y_counterfactual": y_counterfactual,
+            "delta_y": y_factual - y_counterfactual,
+            "b": b,
+            "h0": h0,
+            "s": s,
+            "s_cf": s_cf,
+        }
+
     def get_predictive_check_p_values(self, data_loader):
         self.eval()
 
@@ -1133,34 +1249,26 @@ class CDVAE(BRCausalModel):
         x, x_posterior = self.build_input(data)
         br = self.build_br(x)
 
-        mu_RE, log_var_RE, _ = self.inference_re_given_yxw(x_posterior)
-        if torch.isnan(mu_RE).any():
-            print("The mu_RE contains NaN values.")
-        if torch.isnan(log_var_RE).any():
-            print("The log_var_RE contains NaN values.")
-        mu_RE[torch.isnan(mu_RE)] = 0.0
-        log_var_RE[torch.isnan(log_var_RE)] = 0.0
-
-        q_re_given_yxw = D.Independent(
-            D.Normal(loc=mu_RE, scale=torch.exp(0.5 * log_var_RE)),
-            reinterpreted_batch_ndims=1,  # interpret dim 1 (d_re diemion as a single event)
-        )  # ? Do we need a permutation ?
-
+        inference_outputs = self.inference_re_given_yxw(
+            x_posterior, regime_id=data.get("regime_id")
+        )
         curr_treatments = data["current_treatments"]
         y_observed = data["outputs"]
-        re = q_re_given_yxw.sample()
+        b = inference_outputs["b"]
+        h0 = inference_outputs["h0"]
+        s = inference_outputs["s"]
+        re_struct = self._compose_re_latent(br, b, h0, s)
 
         treatment_pred = self.br_treatment_outcome_head.build_treatment(br, detached=False)
         p_w_x = self.treat_normalizer(treatment_pred)
 
         weights = self.weighting(curr_treatments, p_w_x)
         weights = weights.unsqueeze(0).repeat(self.mc_sample_size, 1, 1, 1)
-        re_extended = re.unsqueeze(1).repeat(1, br.shape[1], 1)
 
         y_observed = y_observed.unsqueeze(0).repeat(self.mc_sample_size, 1, 1, 1)
 
         outcome_pred = self.br_treatment_outcome_head.build_outcome(
-            br, re_extended, curr_treatments, y_dist_type=self.y_dist_type
+            br, re_struct, curr_treatments, y_dist_type=self.y_dist_type
         )
 
         y_dist = self._get_y_dist(outcome_pred)
