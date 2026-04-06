@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.data import RealDatasetCollection, SyntheticDatasetCollection
 from src.models.inference_net import Inference_Net
+from src.models.modules.s_exogenous_prior import SExogenousPrior
 from src.models.time_varying_model import BRCausalModel
 from src.models.utils import *
 from src.models.utils_cdvae import GMMprior, deviance_loss, wasserstein
@@ -65,6 +66,17 @@ class WRep_encoder(BRCausalModel):
             [
                 "treatment_pred",
                 "br",
+            ],
+        )
+        self.IndustrialForwardOutputs = namedtuple(
+            "IndustrialForwardOutputs",
+            [
+                "y_factual",
+                "x_recon",
+                "background_latent",
+                "health_states_base",
+                "fault_strength",
+                "latent_stats",
             ],
         )
         try:
@@ -423,6 +435,11 @@ class CDVAE(BRCausalModel):
             num_layer=self.num_layer,
             dropout_rate=self.dropout_rate,
             activation=self.activation,
+            background_latent_dim=self.z_latent_dim,
+            health_latent_dim=self.health_state_dim,
+            fault_latent_dim=self.fault_state_dim,
+            num_regimes=getattr(self, "num_regimes", None),
+            regime_embed_dim=getattr(self, "regime_embed_dim", 0),
         )
         self.gmm_prior = GMMprior(
             n_clusters=self.n_clusters,
@@ -432,6 +449,42 @@ class CDVAE(BRCausalModel):
             init_type_p_z_given_c=self.init_type_p_z_given_c,
             device=self.device,
         )
+        self._init_industrial_modules()
+
+    def _init_industrial_modules(self):
+        self.industrial_input_projection = nn.LazyLinear(self.input_size)
+        self.health_input_projection = nn.LazyLinear(
+            self.dim_vitals + self.dim_treatments + self.z_latent_dim
+        )
+        self.regime_embedding = nn.Embedding(self.regime_vocab_size, self.context_latent_dim)
+        self.health_transition = nn.GRUCell(
+            self.dim_vitals + self.dim_treatments + self.z_latent_dim,
+            self.health_state_dim,
+        )
+        self.fault_adapter = nn.Sequential(
+            nn.Linear(
+                self.health_state_dim
+                + self.dim_treatments
+                + self.z_latent_dim
+                + self.fault_state_dim
+                + self.context_latent_dim,
+                self.health_state_dim,
+            ),
+            nn.ELU(),
+            nn.Linear(self.health_state_dim, self.health_state_dim),
+        )
+        self.x_decoder = nn.Linear(self.health_state_dim + self.z_latent_dim, self.dim_vitals)
+        self.y_head = nn.Linear(self.health_state_dim + self.z_latent_dim, self.dim_outcome)
+        self.s_exogenous_prior = SExogenousPrior(
+            prior_type=self.s_prior_type,
+            num_regimes=self.regime_vocab_size,
+            latent_dim=self.fault_state_dim,
+            n_components=self.s_prior_gmm_components,
+        )
+
+    def get_last_posterior_heads(self):
+        """Returns the most recent three-head posterior bundle for diagnostics/debugging."""
+        return getattr(self, "latest_inference_outputs", None)
 
     def _init_specific(self, sub_args: DictConfig):
         """
@@ -478,6 +531,16 @@ class CDVAE(BRCausalModel):
             self.lambda_y = sub_args.lambda_y
 
             self.mc_sample_size = sub_args.batch_size // 10
+            self.enable_industrial_soft_sensing = getattr(
+                sub_args, "enable_industrial_soft_sensing", False
+            )
+            self.health_state_dim = getattr(sub_args, "health_state_dim", self.context_latent_dim)
+            self.fault_state_dim = getattr(sub_args, "fault_state_dim", self.context_latent_dim)
+            self.regime_vocab_size = getattr(sub_args, "regime_vocab_size", 32)
+            self.num_regimes = getattr(sub_args, "num_regimes", None)
+            self.regime_embed_dim = getattr(sub_args, "regime_embed_dim", 0)
+            self.s_prior_type = getattr(sub_args, "s_prior_type", "gaussian")
+            self.s_prior_gmm_components = getattr(sub_args, "s_prior_gmm_components", 4)
 
             self.log_y_scale = nn.Parameter(
                 torch.tensor(0.0), requires_grad=self.y_scale_require_grad
@@ -584,13 +647,116 @@ class CDVAE(BRCausalModel):
         br = self.br_treatment_outcome_head.build_br(c)
         return br
 
+    @staticmethod
+    def _is_industrial_batch(batch: dict) -> bool:
+        return all(
+            k in batch for k in ["process_vars", "controls", "outputs", "regime_id", "active_entries"]
+        )
+
+    def build_industrial_input(self, batch: dict) -> torch.Tensor:
+        process_vars = batch["process_vars"]
+        controls = batch["controls"]
+        outputs = batch["outputs"]
+        regime_id = batch["regime_id"]
+
+        prev_x = torch.zeros_like(process_vars)
+        prev_x[:, 1:, :] = process_vars[:, :-1, :]
+        prev_y = torch.zeros_like(outputs)
+        prev_y[:, 1:, :] = outputs[:, :-1, :]
+        regime_embed = self.regime_embedding(regime_id).unsqueeze(1).expand(-1, process_vars.size(1), -1)
+        return torch.cat([prev_x, controls, prev_y, regime_embed], dim=-1)
+
+    def _sample_gaussian(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def _run_industrial_dynamics(
+        self,
+        process_vars: torch.Tensor,
+        controls: torch.Tensor,
+        regime_embed: torch.Tensor,
+        b_latent: torch.Tensor,
+        h0_init: torch.Tensor,
+        s_latent: torch.Tensor,
+    ):
+        batch_size, seq_len, _ = process_vars.shape
+        h_prev = h0_init
+        h_fault_seq, h_base_seq, x_seq, y_seq = [], [], [], []
+        b_seq = b_latent.unsqueeze(1).expand(-1, seq_len, -1)
+
+        for t in range(seq_len):
+            health_in_raw = torch.cat([process_vars[:, t, :], controls[:, t, :], b_latent], dim=-1)
+            health_in = self.health_input_projection(health_in_raw)
+            h0_t = self.health_transition(health_in, h_prev)
+            adapter_in = torch.cat([h0_t, controls[:, t, :], b_latent, s_latent[:, t, :], regime_embed], dim=-1)
+            delta_t = self.fault_adapter(adapter_in)
+            h_t = h0_t + delta_t
+            state_and_b = torch.cat([h_t, b_latent], dim=-1)
+            x_seq.append(self.x_decoder(state_and_b))
+            y_seq.append(self.y_head(state_and_b))
+            h_base_seq.append(h0_t)
+            h_fault_seq.append(h_t)
+            h_prev = h0_t
+
+        return {
+            "x_recon": torch.stack(x_seq, dim=1),
+            "y_factual": torch.stack(y_seq, dim=1),
+            "h_base_seq": torch.stack(h_base_seq, dim=1),
+            "h_fault_seq": torch.stack(h_fault_seq, dim=1),
+            "b_seq": b_seq,
+        }
+
+    @staticmethod
+    def _kl_diag_gaussian(mu_q, logvar_q, mu_p, logvar_p):
+        var_ratio = torch.exp(logvar_q - logvar_p)
+        kl = 0.5 * (
+            logvar_p
+            - logvar_q
+            + var_ratio
+            + ((mu_q - mu_p) ** 2) / torch.exp(logvar_p)
+            - 1.0
+        )
+        return kl.sum(dim=-1)
+
+    def _build_industrial_priors(
+        self, regime_id: torch.Tensor, seq_len: int, regime_seen_mask: torch.Tensor = None
+    ):
+        b_mu = torch.zeros(
+            regime_id.shape[0], self.z_latent_dim, device=regime_id.device, dtype=torch.float32
+        )
+        b_logvar = torch.zeros_like(b_mu)
+        h0_mu = torch.zeros(
+            regime_id.shape[0], self.health_state_dim, device=regime_id.device, dtype=torch.float32
+        )
+        h0_logvar = torch.zeros_like(h0_mu)
+
+        s_mu, s_logvar = self.s_exogenous_prior(
+            regime_id=regime_id, regime_seen_mask=regime_seen_mask, seq_len=seq_len
+        )
+        return {
+            "b_mu": b_mu,
+            "b_logvar": b_logvar,
+            "h0_mu": h0_mu,
+            "h0_logvar": h0_logvar,
+            "s_mu": s_mu,
+            "s_logvar": s_logvar,
+        }
+
     def forward(self, batch: dict, detach_treatment: bool = False):
         """
         Forward pass through the model.
         """
+        if self._is_industrial_batch(batch):
+            return self.forward_industrial(batch)
+
         x, x_posterior = self.build_input(batch)
 
-        mu_RE, log_var_RE, RE_hidden_states = self.inference_re_given_yxw(x_posterior)
+        posterior_heads = self.inference_re_given_yxw(x_posterior, return_dict=True)
+        mu_RE = posterior_heads["compat"]["re_loc"]
+        log_var_RE = posterior_heads["compat"]["re_logvar"]
+        RE_hidden_states = posterior_heads["enc_feat"]
+        self.latest_inference_outputs = posterior_heads
         if torch.isnan(mu_RE).any():
             print("The mu_RE contains NaN values.")
 
@@ -620,6 +786,183 @@ class CDVAE(BRCausalModel):
         return self.ForwardOutputs(
             treatment_pred, outcome_pred, br, mu_RE, re, q_re_given_yxw, RE_hidden_states
         )
+
+    def forward_industrial(self, batch: dict):
+        inference_in = self.industrial_input_projection(self.build_industrial_input(batch))
+        inference_outputs = self.inference_re_given_yxw(
+            inference_in, return_dict=True, regime_context=batch.get("regime_id", None)
+        )
+        self.latest_inference_outputs = inference_outputs
+        latent_stats = inference_outputs["posterior_params"]
+        b_latent = inference_outputs["samples"]["b"]
+        h0_init = inference_outputs["samples"]["h0"]
+        s_latent = inference_outputs["samples"]["s"]
+        regime_seen_mask = batch.get("regime_seen_in_train", None)
+        if regime_seen_mask is not None:
+            regime_seen_mask = regime_seen_mask.bool()
+        priors = self._build_industrial_priors(
+            batch["regime_id"],
+            seq_len=batch["process_vars"].shape[1],
+            regime_seen_mask=regime_seen_mask,
+        )
+        kl_b = self._kl_diag_gaussian(
+            latent_stats["b_loc"], latent_stats["b_logvar"], priors["b_mu"], priors["b_logvar"]
+        ).mean()
+        kl_h0 = self._kl_diag_gaussian(
+            latent_stats["h0_loc"], latent_stats["h0_logvar"], priors["h0_mu"], priors["h0_logvar"]
+        ).mean()
+        kl_s = self._kl_diag_gaussian(
+            latent_stats["s_loc"], latent_stats["s_logvar"], priors["s_mu"], priors["s_logvar"]
+        ).mean()
+
+        regime_embed = self.regime_embedding(batch["regime_id"])
+        rollout = self._run_industrial_dynamics(
+            process_vars=batch["process_vars"],
+            controls=batch["controls"],
+            regime_embed=regime_embed,
+            b_latent=b_latent,
+            h0_init=h0_init,
+            s_latent=s_latent,
+        )
+        return self.IndustrialForwardOutputs(
+            y_factual=rollout["y_factual"],
+            x_recon=rollout["x_recon"],
+            background_latent=b_latent,
+            health_states_base=rollout["h_base_seq"],
+            fault_strength=s_latent,
+            latent_stats={**latent_stats, "kl_b": kl_b, "kl_h0": kl_h0, "kl_s": kl_s},
+        )
+
+    def _abduct_industrial_latents(self, batch: dict):
+        inference_in = self.industrial_input_projection(self.build_industrial_input(batch))
+        inference_outputs = self.inference_re_given_yxw(
+            inference_in, return_dict=True, regime_context=batch.get("regime_id", None)
+        )
+        return (
+            inference_outputs,
+            inference_outputs["samples"]["b"],
+            inference_outputs["samples"]["h0"],
+            inference_outputs["samples"]["s"],
+        )
+
+    def _apply_s_intervention(
+        self,
+        s: torch.Tensor,
+        action: str = "zero",
+        intervention_s: torch.Tensor = None,
+        intervention_mask: torch.Tensor = None,
+        regime_override: torch.Tensor = None,
+        regime_seen_mask: torch.Tensor = None,
+        use_unknown_prior: bool = True,
+    ) -> torch.Tensor:
+        _ = regime_seen_mask
+        if intervention_mask is None:
+            intervention_mask = torch.ones_like(s, dtype=torch.bool)
+
+        if action == "zero":
+            s_target = torch.zeros_like(s)
+        elif action == "replace":
+            if intervention_s is None:
+                raise ValueError("`intervention_s` must be provided when action='replace'.")
+            s_target = intervention_s
+        elif action == "prior_mean":
+            if regime_override is None:
+                if use_unknown_prior:
+                    regime_override = torch.zeros(
+                        s.shape[0], dtype=torch.long, device=s.device
+                    )  # default no-fault center
+                else:
+                    raise ValueError(
+                        "`regime_override` is required for action='prior_mean' when use_unknown_prior=False."
+                    )
+            priors = self._build_industrial_priors(
+                regime_override, seq_len=s.shape[1], regime_seen_mask=regime_seen_mask
+            )
+            s_target = priors["s_mu"]
+        else:
+            raise ValueError(f"Unsupported intervention action: {action}")
+
+        return torch.where(intervention_mask, s_target, s)
+
+    def counterfactual_query(
+        self,
+        batch: dict,
+        intervention_s: torch.Tensor = None,
+        intervention_mask: torch.Tensor = None,
+        action: str = "zero",
+        regime_override: torch.Tensor = None,
+        use_unknown_prior: bool = True,
+        return_latents: bool = False,
+    ):
+        _, b_latent, h0_init, s_latent = self._abduct_industrial_latents(batch)
+
+        factual_rollout = self._run_industrial_dynamics(
+            process_vars=batch["process_vars"],
+            controls=batch["controls"],
+            regime_embed=self.regime_embedding(batch["regime_id"]),
+            b_latent=b_latent,
+            h0_init=h0_init,
+            s_latent=s_latent,
+        )
+
+        if regime_override is None:
+            regime_override = torch.zeros_like(batch["regime_id"], dtype=torch.long)
+        elif isinstance(regime_override, int):
+            regime_override = torch.full_like(batch["regime_id"], fill_value=int(regime_override))
+
+        regime_embed = self.regime_embedding(regime_override)
+        s_cf = self._apply_s_intervention(
+            s=s_latent,
+            action=action,
+            intervention_s=intervention_s,
+            intervention_mask=intervention_mask,
+            regime_override=regime_override,
+            regime_seen_mask=batch.get("regime_seen_in_train", None),
+            use_unknown_prior=use_unknown_prior,
+        )
+        rollout_cf = self._run_industrial_dynamics(
+            process_vars=batch["process_vars"],
+            controls=batch["controls"],
+            regime_embed=regime_embed,
+            b_latent=b_latent,
+            h0_init=h0_init,
+            s_latent=s_cf,
+        )
+        y_cf = rollout_cf["y_factual"]
+        y_factual = factual_rollout["y_factual"]
+        result = {
+            "y_factual": y_factual,
+            "y_counterfactual_normal": y_cf,
+            "delta_quality": y_factual - y_cf,
+            "applied_action": action,
+            "regime_override": regime_override,
+        }
+        if return_latents:
+            result.update(
+                {
+                    "background_latent": b_latent,
+                    "healthy_initial_state": h0_init,
+                    "fault_strength": s_latent,
+                    "fault_strength_counterfactual": s_cf,
+                }
+            )
+        return result
+
+    def industrial_latent_diagnostics(self, batch: dict, normal_regime_id: int = 0):
+        outputs = self.counterfactual_query(
+            batch,
+            action="zero",
+            regime_override=normal_regime_id,
+            return_latents=True,
+        )
+        s_abs_mean = outputs["fault_strength"].abs().mean(dim=(1, 2))
+        delta_direction = outputs["delta_quality"].mean(dim=(1, 2))
+        b_var = outputs["background_latent"].var(dim=-1)
+        return {
+            "s_abs_mean": s_abs_mean,
+            "delta_quality_mean": delta_direction,
+            "background_variance": b_var,
+        }
 
     def _get_y_dist(self, outcome_pred: torch.Tensor):
         """
@@ -1133,7 +1476,10 @@ class CDVAE(BRCausalModel):
         x, x_posterior = self.build_input(data)
         br = self.build_br(x)
 
-        mu_RE, log_var_RE, _ = self.inference_re_given_yxw(x_posterior)
+        inference_outputs = self.inference_re_given_yxw(x_posterior, return_dict=True)
+        self.latest_inference_outputs = inference_outputs
+        mu_RE = inference_outputs["compat"]["re_loc"]
+        log_var_RE = inference_outputs["compat"]["re_logvar"]
         if torch.isnan(mu_RE).any():
             print("The mu_RE contains NaN values.")
         if torch.isnan(log_var_RE).any():
