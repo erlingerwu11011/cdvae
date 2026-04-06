@@ -1,0 +1,25 @@
+# @package _global_
+dataset:
+  _target_: src.data.native_fault_dataset_collection.NativeFaultDatasetCollection
+  # Path to an npz file with keys:
+  # process_vars [N, T, p], controls [N, T, m], outputs [N, T, 1], regime_id [N]
+  data_path: data/processed/native_fault_demo.npz
+
+  # native-fault protocol:
+  # train/val on seen regimes, test on held-out regimes
+  train_regimes: [0, 1, 2, 3]
+  test_regimes: [4]
+  val_ratio: 0.1
+  seed: ${exp.seed}
+
+  val_batch_size: 256
+
+model:
+  dim_treatments: 1
+  dim_vitals: 1
+  dim_static_features: 0
+  dim_outcomes: 1
+
+exp:
+  unscale_rmse: True
+  percentage_rmse: False
