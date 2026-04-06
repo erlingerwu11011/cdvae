@@ -1,56 +1,8 @@
-# --------- Core Dependencies --------- #
-numpy
-pandas>=1.3.0
-scipy
+torch
 scikit-learn
-# --------- Machine Learning & Optimization --------- #
-ray[tune]
-optuna
-einops
-hdbscan
-# --------- Data Processing & Storage --------- #
-tables
-fastparquet
-pyarrow
-dask
-# --------- Development & Testing --------- #
-pytest
-flake8
-docker
-python-dotenv>=0.5.1
-pre-commit
-# --------- Config & Exps --------- #
-PyYAML
-hydra-core
-hydra_colorlog
-mlflow
-# --------- torch --------- #
-torch==1.12.1    # Compatible with CUDA Version: 11.4
-pytorch-lightning==1.4.5
-torchmetrics==0.6.0
-torchview
-torchviz
-torch-ema
-lightning-utilities
-# --------- Viz --------- #
-umap-learn
-scienceplots
-bokeh
-datashader
-graphviz
-holoviews
-matplotlib-inline
-matplotlib
-networkx
-seaborn
-# --------- General Utilities --------- #
-rootutils
-rich
-tqdm
-cloudpickle
-python-dateutil
-pyparsing
-zipp
-importlib-metadata<5.0
-# --------- Package Management--------- #
-pip
+lightning
+statsmodels
+zuko==1.3.1
+torchdiffeq
+geomloss
+tueplots

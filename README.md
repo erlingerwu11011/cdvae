@@ -1,34 +1,50 @@
-# Causal Dynamic Variational Autoencoder for Counterfactual Regression in Longitudinal Data.
+[![arXiv](https://img.shields.io/badge/arXiv-2505.02212-b31b1b.svg)]([.](https://arxiv.org/abs/2505.02212))
+[![Venue](https://img.shields.io/badge/venue-ICML_2025-darkblue)](https://arxiv.org/abs/2505.02212)
 
-The implementation utilizes the **Hydra** package for configuration management and **PyTorch Lightning** for model building and training. The code structure follows best practices from the [Lightning-Hydra Template](https://github.com/ashleve/lightning-hydra-template).
+# Exogenous Isomorphism for Counterfactual Identifiability
 
-Baseline implementations, including **RMSN, CRN, G-Net, and Causal Transformer**, extended from the [Causal Transformer](https://arxiv.org/abs/2204.07258), originally available [here](https://github.com/Valentyn1997/CausalTransformer) under the MIT license. **Causal CPC** is adapted from [this paper](https://arxiv.org/pdf/2406.00535).
+This repository contains the complete code for "[Exogenous Isomorphism for Counterfactual Identifiability](https://arxiv.org/abs/2505.02212) [ICML 25 Spotlight]".
 
----
+## Requirements
 
-## Installation
-To set up the environment and install dependencies, run:
-```sh
-conda create -n myenv python=3.10
-conda activate myenv
+Requires `Python >= 3.10`. Install dependencies with
+
+```shell
 pip install -r requirements.txt
 ```
 
----
+## Reproduce All Experiments
 
-## Configuration
-- **Model configurations**: Located in `settings/model/`
-- **Dataset configurations**: Located in `settings/dataset/`
+Run experiments:
 
-For **MIMIC-III data**, place the file [all_hourly_data.h5](https://github.com/MLforHealth/MIMIC_Extract) in:
+```shell
+bash tmscm_sym_ablation.sh
+bash tmscm_sym_exogenous.sh
+bash tmscm_er_ablation.sh
 ```
-data/processed/
+
+The results are saved in `experiments` (~22.5GB).
+
+### Produce Figures and Tables
+
+Generate figures and tables from experiment results:
+
+```shell
+python graphics.py
 ```
 
----
+Then you can find figures and tables in `script/graphics/`. Note that you may need to delete `script/graphics/cache`, `script/graphics/figures` and `script/graphics/tables` first if you want to reproduce new results.
 
-## Usage
-To train CDVAE with a specific seed:
-```sh
-PYTHONPATH=. python3 runnables/train_cdvae.py exp.seed=10
+## Citation
+
+```bib
+@misc{chen2025exogenousisomorphismcounterfactualidentifiability,
+    title={Exogenous Isomorphism for Counterfactual Identifiability}, 
+    author={Yikang Chen and Dehui Du},
+    year={2025},
+    eprint={2505.02212},
+    archivePrefix={arXiv},
+    primaryClass={cs.LG},
+    url={https://arxiv.org/abs/2505.02212}, 
+}
 ```
