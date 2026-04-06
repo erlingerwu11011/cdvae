@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.data import RealDatasetCollection, SyntheticDatasetCollection
 from src.models.inference_net import Inference_Net
+from src.models.modules.s_exogenous_prior import SExogenousPrior
 from src.models.time_varying_model import BRCausalModel
 from src.models.utils import *
 from src.models.utils_cdvae import GMMprior, deviance_loss, wasserstein
@@ -474,10 +475,12 @@ class CDVAE(BRCausalModel):
         )
         self.x_decoder = nn.Linear(self.health_state_dim + self.z_latent_dim, self.dim_vitals)
         self.y_head = nn.Linear(self.health_state_dim + self.z_latent_dim, self.dim_outcome)
-        self.s_prior_loc = nn.Embedding(self.regime_vocab_size, self.fault_state_dim)
-        self.s_prior_logvar = nn.Embedding(self.regime_vocab_size, self.fault_state_dim)
-        nn.init.zeros_(self.s_prior_loc.weight)
-        nn.init.zeros_(self.s_prior_logvar.weight)
+        self.s_exogenous_prior = SExogenousPrior(
+            prior_type=self.s_prior_type,
+            num_regimes=self.regime_vocab_size,
+            latent_dim=self.fault_state_dim,
+            n_components=self.s_prior_gmm_components,
+        )
 
     def get_last_posterior_heads(self):
         """Returns the most recent three-head posterior bundle for diagnostics/debugging."""
@@ -536,6 +539,8 @@ class CDVAE(BRCausalModel):
             self.regime_vocab_size = getattr(sub_args, "regime_vocab_size", 32)
             self.num_regimes = getattr(sub_args, "num_regimes", None)
             self.regime_embed_dim = getattr(sub_args, "regime_embed_dim", 0)
+            self.s_prior_type = getattr(sub_args, "s_prior_type", "gaussian")
+            self.s_prior_gmm_components = getattr(sub_args, "s_prior_gmm_components", 4)
 
             self.log_y_scale = nn.Parameter(
                 torch.tensor(0.0), requires_grad=self.y_scale_require_grad
@@ -714,7 +719,9 @@ class CDVAE(BRCausalModel):
         )
         return kl.sum(dim=-1)
 
-    def _build_industrial_priors(self, regime_id: torch.Tensor, seq_len: int):
+    def _build_industrial_priors(
+        self, regime_id: torch.Tensor, seq_len: int, regime_seen_mask: torch.Tensor = None
+    ):
         b_mu = torch.zeros(
             regime_id.shape[0], self.z_latent_dim, device=regime_id.device, dtype=torch.float32
         )
@@ -724,10 +731,9 @@ class CDVAE(BRCausalModel):
         )
         h0_logvar = torch.zeros_like(h0_mu)
 
-        s_mu_regime = self.s_prior_loc(regime_id)
-        s_logvar_regime = self.s_prior_logvar(regime_id)
-        s_mu = s_mu_regime.unsqueeze(1).expand(-1, seq_len, -1)
-        s_logvar = s_logvar_regime.unsqueeze(1).expand(-1, seq_len, -1)
+        s_mu, s_logvar = self.s_exogenous_prior(
+            regime_id=regime_id, regime_seen_mask=regime_seen_mask, seq_len=seq_len
+        )
         return {
             "b_mu": b_mu,
             "b_logvar": b_logvar,
@@ -791,7 +797,14 @@ class CDVAE(BRCausalModel):
         b_latent = inference_outputs["samples"]["b"]
         h0_init = inference_outputs["samples"]["h0"]
         s_latent = inference_outputs["samples"]["s"]
-        priors = self._build_industrial_priors(batch["regime_id"], seq_len=batch["process_vars"].shape[1])
+        regime_seen_mask = batch.get("regime_seen_in_train", None)
+        if regime_seen_mask is not None:
+            regime_seen_mask = regime_seen_mask.bool()
+        priors = self._build_industrial_priors(
+            batch["regime_id"],
+            seq_len=batch["process_vars"].shape[1],
+            regime_seen_mask=regime_seen_mask,
+        )
         kl_b = self._kl_diag_gaussian(
             latent_stats["b_loc"], latent_stats["b_logvar"], priors["b_mu"], priors["b_logvar"]
         ).mean()
@@ -862,7 +875,9 @@ class CDVAE(BRCausalModel):
                     raise ValueError(
                         "`regime_override` is required for action='prior_mean' when use_unknown_prior=False."
                     )
-            priors = self._build_industrial_priors(regime_override, seq_len=s.shape[1])
+            priors = self._build_industrial_priors(
+                regime_override, seq_len=s.shape[1], regime_seen_mask=regime_seen_mask
+            )
             s_target = priors["s_mu"]
         else:
             raise ValueError(f"Unsupported intervention action: {action}")
@@ -902,6 +917,7 @@ class CDVAE(BRCausalModel):
             intervention_s=intervention_s,
             intervention_mask=intervention_mask,
             regime_override=regime_override,
+            regime_seen_mask=batch.get("regime_seen_in_train", None),
             use_unknown_prior=use_unknown_prior,
         )
         rollout_cf = self._run_industrial_dynamics(
