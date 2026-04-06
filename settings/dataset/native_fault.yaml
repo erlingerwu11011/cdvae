@@ -1,0 +1,26 @@
+# @package _global_
+dataset:
+  _target_: src.data.native_fault_dataset_collection.NativeFaultDatasetCollection
+  name: native_fault
+  path: data/native_fault/native_fault_episodes.npz
+
+  # seen regimes for training/validation (e.g. normal + known faults)
+  train_regimes: [0, 1, 2, 3]
+  # held-out regimes for testing
+  test_regimes: [4]
+
+  val_ratio: 0.1
+  seed: ${exp.seed}
+  normalize: true
+  eps: 1.0e-6
+
+  # fields used by training entrypoints expecting dataset metadata
+  max_seq_length: 100
+  projection_horizon: 1
+  val_batch_size: 256
+  autoregressive: true
+  treatment_mode: multilabel
+
+exp:
+  unscale_rmse: false
+  percentage_rmse: false
