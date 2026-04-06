@@ -590,7 +590,14 @@ class CDVAE(BRCausalModel):
         """
         x, x_posterior = self.build_input(batch)
 
-        mu_RE, log_var_RE, RE_hidden_states = self.inference_re_given_yxw(x_posterior)
+        inference_outputs = self.inference_re_given_yxw(
+            x_posterior, regime_id=batch.get("regime_id")
+        )
+        self.latest_inference_outputs = inference_outputs
+
+        mu_RE = inference_outputs["re_loc"]
+        log_var_RE = inference_outputs["re_logvar"]
+        RE_hidden_states = inference_outputs["enc_feat"]
         if torch.isnan(mu_RE).any():
             print("The mu_RE contains NaN values.")
 
@@ -1133,7 +1140,11 @@ class CDVAE(BRCausalModel):
         x, x_posterior = self.build_input(data)
         br = self.build_br(x)
 
-        mu_RE, log_var_RE, _ = self.inference_re_given_yxw(x_posterior)
+        inference_outputs = self.inference_re_given_yxw(
+            x_posterior, regime_id=data.get("regime_id")
+        )
+        mu_RE = inference_outputs["re_loc"]
+        log_var_RE = inference_outputs["re_logvar"]
         if torch.isnan(mu_RE).any():
             print("The mu_RE contains NaN values.")
         if torch.isnan(log_var_RE).any():
