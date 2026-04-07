@@ -15,7 +15,10 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.data import RealDatasetCollection, SyntheticDatasetCollection
 from src.models.inference_net import Inference_Net
-from src.models.modules.s_exogenous_prior import SExogenousPrior
+from src.models.modules.fault_adapter import build_fault_adapter
+from src.models.modules.s_exogenous_prior import (
+    build_s_exogenous_prior,
+)
 from src.models.time_varying_model import BRCausalModel
 from src.models.utils import *
 from src.models.utils_cdvae import GMMprior, deviance_loss, wasserstein
@@ -76,6 +79,7 @@ class WRep_encoder(BRCausalModel):
                 "background_latent",
                 "health_states_base",
                 "fault_strength",
+                "fault_effect",
                 "latent_stats",
             ],
         )
@@ -461,25 +465,27 @@ class CDVAE(BRCausalModel):
             self.dim_vitals + self.dim_treatments + self.z_latent_dim,
             self.health_state_dim,
         )
-        self.fault_adapter = nn.Sequential(
-            nn.Linear(
-                self.health_state_dim
-                + self.dim_treatments
-                + self.z_latent_dim
-                + self.fault_state_dim
-                + self.context_latent_dim,
-                self.health_state_dim,
-            ),
-            nn.ELU(),
-            nn.Linear(self.health_state_dim, self.health_state_dim),
+        fault_context_dim = (
+            self.health_state_dim
+            + self.dim_treatments
+            + self.z_latent_dim
+            + self.context_latent_dim
+        )
+        self.fault_adapter = build_fault_adapter(
+            fault_adapter_type=self.fault_adapter_type,
+            s_dim=self.fault_state_dim,
+            context_dim=fault_context_dim,
+            output_dim=self.health_state_dim,
+            hidden_dim=self.health_state_dim,
         )
         self.x_decoder = nn.Linear(self.health_state_dim + self.z_latent_dim, self.dim_vitals)
         self.y_head = nn.Linear(self.health_state_dim + self.z_latent_dim, self.dim_outcome)
-        self.s_exogenous_prior = SExogenousPrior(
+        self.s_prior = build_s_exogenous_prior(
             prior_type=self.s_prior_type,
             num_regimes=self.regime_vocab_size,
             latent_dim=self.fault_state_dim,
             n_components=self.s_prior_gmm_components,
+            gaussian_mode=self.s_prior_gaussian_mode,
         )
 
     def get_last_posterior_heads(self):
@@ -541,6 +547,8 @@ class CDVAE(BRCausalModel):
             self.regime_embed_dim = getattr(sub_args, "regime_embed_dim", 0)
             self.s_prior_type = getattr(sub_args, "s_prior_type", "gaussian")
             self.s_prior_gmm_components = getattr(sub_args, "s_prior_gmm_components", 4)
+            self.s_prior_gaussian_mode = getattr(sub_args, "s_prior_gaussian_mode", "regime_embedded")
+            self.fault_adapter_type = getattr(sub_args, "fault_adapter_type", "mlp")
 
             self.log_y_scale = nn.Parameter(
                 torch.tensor(0.0), requires_grad=self.y_scale_require_grad
@@ -682,28 +690,33 @@ class CDVAE(BRCausalModel):
     ):
         batch_size, seq_len, _ = process_vars.shape
         h_prev = h0_init
-        h_fault_seq, h_base_seq, x_seq, y_seq = [], [], [], []
+        h_fault_seq, h_base_seq, fault_effect_seq, x_seq, y_seq = [], [], [], [], []
         b_seq = b_latent.unsqueeze(1).expand(-1, seq_len, -1)
 
         for t in range(seq_len):
             health_in_raw = torch.cat([process_vars[:, t, :], controls[:, t, :], b_latent], dim=-1)
             health_in = self.health_input_projection(health_in_raw)
             h0_t = self.health_transition(health_in, h_prev)
-            adapter_in = torch.cat([h0_t, controls[:, t, :], b_latent, s_latent[:, t, :], regime_embed], dim=-1)
-            delta_t = self.fault_adapter(adapter_in)
-            h_t = h0_t + delta_t
+            healthy_effect_t = h0_t
+            adapter_context = torch.cat(
+                [healthy_effect_t, controls[:, t, :], b_latent, regime_embed], dim=-1
+            )
+            fault_effect_t = self.fault_adapter(s_latent[:, t, :], context=adapter_context)
+            h_t = healthy_effect_t + fault_effect_t
             state_and_b = torch.cat([h_t, b_latent], dim=-1)
             x_seq.append(self.x_decoder(state_and_b))
             y_seq.append(self.y_head(state_and_b))
-            h_base_seq.append(h0_t)
+            h_base_seq.append(healthy_effect_t)
             h_fault_seq.append(h_t)
-            h_prev = h0_t
+            fault_effect_seq.append(fault_effect_t)
+            h_prev = healthy_effect_t
 
         return {
             "x_recon": torch.stack(x_seq, dim=1),
             "y_factual": torch.stack(y_seq, dim=1),
             "h_base_seq": torch.stack(h_base_seq, dim=1),
             "h_fault_seq": torch.stack(h_fault_seq, dim=1),
+            "fault_effect_seq": torch.stack(fault_effect_seq, dim=1),
             "b_seq": b_seq,
         }
 
@@ -731,7 +744,7 @@ class CDVAE(BRCausalModel):
         )
         h0_logvar = torch.zeros_like(h0_mu)
 
-        s_mu, s_logvar = self.s_exogenous_prior(
+        s_mu, s_logvar = self.s_prior(
             regime_id=regime_id, regime_seen_mask=regime_seen_mask, seq_len=seq_len
         )
         return {
@@ -749,6 +762,11 @@ class CDVAE(BRCausalModel):
         """
         if self._is_industrial_batch(batch):
             return self.forward_industrial(batch)
+        if self.enable_industrial_soft_sensing:
+            raise ValueError(
+                "Industrial soft-sensing mode is enabled, but batch is not in industrial format. "
+                "Refusing legacy re_* fallback path."
+            )
 
         x, x_posterior = self.build_input(batch)
 
@@ -811,8 +829,11 @@ class CDVAE(BRCausalModel):
         kl_h0 = self._kl_diag_gaussian(
             latent_stats["h0_loc"], latent_stats["h0_logvar"], priors["h0_mu"], priors["h0_logvar"]
         ).mean()
-        kl_s = self._kl_diag_gaussian(
-            latent_stats["s_loc"], latent_stats["s_logvar"], priors["s_mu"], priors["s_logvar"]
+        kl_s = self.s_prior.kl(
+            q_loc=latent_stats["s_loc"],
+            q_logvar=latent_stats["s_logvar"],
+            regime_id=batch["regime_id"],
+            regime_seen_mask=regime_seen_mask,
         ).mean()
 
         regime_embed = self.regime_embedding(batch["regime_id"])
@@ -830,6 +851,7 @@ class CDVAE(BRCausalModel):
             background_latent=b_latent,
             health_states_base=rollout["h_base_seq"],
             fault_strength=s_latent,
+            fault_effect=rollout["fault_effect_seq"],
             latent_stats={**latent_stats, "kl_b": kl_b, "kl_h0": kl_h0, "kl_s": kl_s},
         )
 
@@ -855,28 +877,33 @@ class CDVAE(BRCausalModel):
         regime_seen_mask: torch.Tensor = None,
         use_unknown_prior: bool = True,
     ) -> torch.Tensor:
-        _ = regime_seen_mask
         if intervention_mask is None:
             intervention_mask = torch.ones_like(s, dtype=torch.bool)
+        else:
+            intervention_mask = intervention_mask.to(device=s.device).bool()
+            while intervention_mask.dim() < s.dim():
+                intervention_mask = intervention_mask.unsqueeze(-1)
 
         if action == "zero":
             s_target = torch.zeros_like(s)
         elif action == "replace":
             if intervention_s is None:
                 raise ValueError("`intervention_s` must be provided when action='replace'.")
-            s_target = intervention_s
+            s_target = intervention_s.to(device=s.device, dtype=s.dtype)
         elif action == "prior_mean":
-            if regime_override is None:
-                if use_unknown_prior:
-                    regime_override = torch.zeros(
-                        s.shape[0], dtype=torch.long, device=s.device
-                    )  # default no-fault center
-                else:
-                    raise ValueError(
-                        "`regime_override` is required for action='prior_mean' when use_unknown_prior=False."
-                    )
+            regime_query = regime_override
+            if regime_query is None and not use_unknown_prior:
+                raise ValueError(
+                    "`regime_override` is required for action='prior_mean' when use_unknown_prior=False."
+                )
+            if regime_query is None:
+                regime_query = torch.zeros(s.shape[0], dtype=torch.long, device=s.device)
+            if regime_seen_mask is not None:
+                regime_seen_mask = regime_seen_mask.to(device=s.device).bool()
+            elif use_unknown_prior:
+                regime_seen_mask = torch.zeros(s.shape[0], dtype=torch.bool, device=s.device)
             priors = self._build_industrial_priors(
-                regime_override, seq_len=s.shape[1], regime_seen_mask=regime_seen_mask
+                regime_query, seq_len=s.shape[1], regime_seen_mask=regime_seen_mask
             )
             s_target = priors["s_mu"]
         else:
@@ -895,6 +922,11 @@ class CDVAE(BRCausalModel):
         return_latents: bool = False,
     ):
         _, b_latent, h0_init, s_latent = self._abduct_industrial_latents(batch)
+        b_latent = b_latent.clone()
+        h0_init = h0_init.clone()
+        s_latent = s_latent.clone()
+        if intervention_mask is None:
+            intervention_mask = batch.get("intervention_mask_s", None)
 
         factual_rollout = self._run_industrial_dynamics(
             process_vars=batch["process_vars"],
@@ -906,17 +938,19 @@ class CDVAE(BRCausalModel):
         )
 
         if regime_override is None:
-            regime_override = torch.zeros_like(batch["regime_id"], dtype=torch.long)
+            regime_for_rollout = batch["regime_id"]
         elif isinstance(regime_override, int):
-            regime_override = torch.full_like(batch["regime_id"], fill_value=int(regime_override))
+            regime_for_rollout = torch.full_like(batch["regime_id"], fill_value=int(regime_override))
+        else:
+            regime_for_rollout = regime_override
 
-        regime_embed = self.regime_embedding(regime_override)
+        regime_embed = self.regime_embedding(regime_for_rollout)
         s_cf = self._apply_s_intervention(
             s=s_latent,
             action=action,
             intervention_s=intervention_s,
             intervention_mask=intervention_mask,
-            regime_override=regime_override,
+            regime_override=regime_for_rollout,
             regime_seen_mask=batch.get("regime_seen_in_train", None),
             use_unknown_prior=use_unknown_prior,
         )
@@ -931,12 +965,20 @@ class CDVAE(BRCausalModel):
         y_cf = rollout_cf["y_factual"]
         y_factual = factual_rollout["y_factual"]
         result = {
+            "b": b_latent,
+            "h0": h0_init,
+            "s_factual": s_latent,
+            "s_counterfactual": s_cf,
+            "fault_effect_factual": factual_rollout["fault_effect_seq"],
+            "fault_effect_counterfactual": rollout_cf["fault_effect_seq"],
             "y_factual": y_factual,
-            "y_counterfactual_normal": y_cf,
-            "delta_quality": y_factual - y_cf,
+            "y_counterfactual": y_cf,
+            "delta_y": y_factual - y_cf,
             "applied_action": action,
-            "regime_override": regime_override,
+            "regime_override": regime_for_rollout,
         }
+        result["y_counterfactual_normal"] = result["y_counterfactual"]
+        result["delta_quality"] = result["delta_y"]
         if return_latents:
             result.update(
                 {
@@ -963,6 +1005,86 @@ class CDVAE(BRCausalModel):
             "delta_quality_mean": delta_direction,
             "background_variance": b_var,
         }
+
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.to(values.device).bool()
+        if mask.numel() == 0 or not torch.any(mask):
+            return torch.zeros((), device=values.device, dtype=values.dtype)
+        return values[mask].mean()
+
+    def _validation_or_test_step_industrial(self, batch: dict, stage: str) -> torch.Tensor:
+        outputs = self.forward_industrial(batch)
+        active_entries = batch.get("active_entries", torch.ones_like(batch["outputs"]))
+        recon_error = ((outputs.y_factual - batch["outputs"]) ** 2) * active_entries
+        denom = active_entries.sum().clamp(min=1.0)
+        loss_recon = recon_error.sum() / denom
+
+        kl_b = outputs.latent_stats["kl_b"]
+        kl_h0 = outputs.latent_stats["kl_h0"]
+        kl_s = outputs.latent_stats["kl_s"]
+
+        is_fault = batch.get("is_fault", None)
+        if is_fault is None:
+            is_fault = torch.ones(batch["regime_id"].shape[0], device=batch["regime_id"].device)
+        is_fault = is_fault.reshape(-1)
+        fault_mask = is_fault > 0.5
+        normal_mask = ~fault_mask
+
+        s_norm_per_sample = outputs.fault_strength.abs().mean(dim=(1, 2))
+        s_norm_normal = self._masked_mean(s_norm_per_sample, normal_mask)
+        s_norm_fault = self._masked_mean(s_norm_per_sample, fault_mask)
+
+        cf_outputs = self.counterfactual_query(
+            batch,
+            action="zero",
+            regime_override=0,
+            return_latents=False,
+        )
+        delta_abs_per_sample = cf_outputs["delta_quality"].abs().mean(dim=(1, 2))
+        delta_y_abs_normal = self._masked_mean(delta_abs_per_sample, normal_mask)
+        delta_y_abs_fault = self._masked_mean(delta_abs_per_sample, fault_mask)
+
+        normal_reference = batch.get("matched_normal_reference", torch.zeros_like(batch["outputs"]))
+        dist_factual = (cf_outputs["y_factual"] - normal_reference).abs().mean(dim=(1, 2))
+        dist_cf = (cf_outputs["y_counterfactual_normal"] - normal_reference).abs().mean(dim=(1, 2))
+        cf_shift_toward_normal = (dist_factual - dist_cf).mean()
+
+        self.log(
+            f"{stage}/loss_recon_industrial",
+            loss_recon,
+            on_epoch=True,
+            on_step=False,
+            sync_dist=True,
+            prog_bar=(stage != "test"),
+        )
+        self.log(f"{stage}/kl_b", kl_b, on_epoch=True, on_step=False, sync_dist=True)
+        self.log(f"{stage}/kl_h0", kl_h0, on_epoch=True, on_step=False, sync_dist=True)
+        self.log(f"{stage}/kl_s", kl_s, on_epoch=True, on_step=False, sync_dist=True)
+        self.log(f"{stage}/s_norm_normal", s_norm_normal, on_epoch=True, on_step=False, sync_dist=True)
+        self.log(f"{stage}/s_norm_fault", s_norm_fault, on_epoch=True, on_step=False, sync_dist=True)
+        self.log(
+            f"{stage}/delta_y_abs_normal",
+            delta_y_abs_normal,
+            on_epoch=True,
+            on_step=False,
+            sync_dist=True,
+        )
+        self.log(
+            f"{stage}/delta_y_abs_fault",
+            delta_y_abs_fault,
+            on_epoch=True,
+            on_step=False,
+            sync_dist=True,
+        )
+        self.log(
+            f"{stage}/cf_shift_toward_normal",
+            cf_shift_toward_normal,
+            on_epoch=True,
+            on_step=False,
+            sync_dist=True,
+        )
+        return loss_recon
 
     def _get_y_dist(self, outcome_pred: torch.Tensor):
         """
@@ -1106,6 +1228,8 @@ class CDVAE(BRCausalModel):
         """
         Validation step to calculate and log loss.
         """
+        if self._is_industrial_batch(batch):
+            return self._validation_or_test_step_industrial(batch, stage="val")
 
         val_loss = self._shared_step(batch, "val")
 
@@ -1115,6 +1239,8 @@ class CDVAE(BRCausalModel):
         """
         Validation step to calculate and log loss.
         """
+        if self._is_industrial_batch(batch):
+            return self._validation_or_test_step_industrial(batch, stage="test")
         return self._shared_step(batch, "test")
 
     def predict_step(self, batch, batch_idx, dataset_idx=None):
