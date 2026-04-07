@@ -41,6 +41,10 @@ model:
     percentage_steps_ipm: 0.1
 
     y_scale_require_grad: True
+    s_prior_type: gaussian
+    s_prior_gaussian_mode: regime_embedded
+    s_prior_gmm_components: 4
+    fault_adapter_type: mlp
 
     gmm_prior:
       n_clusters: 7
